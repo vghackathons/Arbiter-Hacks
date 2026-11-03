@@ -1,0 +1,455 @@
+import SwiftUI
+import SeismicCore
+import SeismicSignal
+
+/// The live seismograph.
+///
+/// Three axes, the trigger ratio beneath, and the processing chain laid open so
+/// the user can see exactly what has been done to the signal between the sensor
+/// and the screen. Freezing the trace is a first-class action rather than a
+/// hidden gesture, because the interesting moment is always the one that has
+/// just scrolled past.
+struct MonitorScreen: View {
+    @EnvironmentObject private var env: AppEnvironment
+    @EnvironmentObject private var node: NodeStream
+
+    @State private var frozen: TriaxialRecord?
+    @State private var windowSeconds: Double = 30
+    @State private var showsFiltered = true
+    @State private var selectedAxes: Set<TriaxialRecord.Axis> = [.x, .y, .z]
+
+    private var record: TriaxialRecord {
+        frozen ?? node.snapshot?.recent ?? TriaxialRecord.zeros(count: 0, sampleRate: 100)
+    }
+
+    /// The window actually drawn, prepared off the render path.
+    ///
+    /// This used to be a computed property, and it was the single most
+    /// expensive thing in the app. Slicing thirty seconds of three axes and
+    /// running a fourth-order Butterworth over all of it is roughly nine
+    /// thousand samples of IIR filtering — and being a computed property, it
+    /// ran on *every* body evaluation, which the 20 Hz snapshot guaranteed.
+    /// The chart then threw most of it away, because a trace 390 points wide
+    /// cannot show three thousand samples per axis.
+    ///
+    /// Now it is computed when the data changes rather than when the view
+    /// draws, and decimated to what the screen can actually resolve.
+    @State private var prepared = TriaxialRecord.zeros(count: 0, sampleRate: 100)
+
+    /// Peak ground motion for the visible window.
+    ///
+    /// Computed alongside the filtering rather than in the view body. It reads
+    /// like a cheap lookup and is not: deriving peak velocity and displacement
+    /// integrates the whole window twice, and a profile of this screen showed
+    /// the integration running on SwiftUI's render thread — the single largest
+    /// consumer on a screen that was holding a core at ninety-five per cent.
+    @State private var peaks: PeakValues?
+
+    /// The chart's vertical scale, computed once per window.
+    ///
+    /// `WaveformChart` otherwise derives it by scanning every sample for its
+    /// peak — inside the Canvas closure, so once per redraw per channel. A
+    /// profile put that scan among the largest costs on the screen, which is
+    /// absurd for a number that changes only when the data does.
+    @State private var displayScale: Double?
+
+    // MARK: The measurement nobody has to take
+
+    /// What the overnight measurement has been doing.
+    ///
+    /// Shown rather than left to run silently. Something that writes to the
+    /// record of your own building while you are asleep has to be able to say
+    /// what it wrote, when, and — the part that matters most — when it decided
+    /// not to. A skipped night is information: it usually means the building
+    /// was not quiet, and a building that is never quiet is one whose history
+    /// will always be thinner than the sales pitch implies.
+    private var nightlyBaseline: some View {
+        VStack(alignment: .leading, spacing: Theme.Metrics.spacing) {
+            HStack {
+                SectionLabel("Overnight measurement", systemImage: "moon.zzz")
+                Spacer()
+                StatusPill(text: env.baseline.isEnabled ? "On" : "Off",
+                           tint: env.baseline.isEnabled ? Theme.Palette.accent
+                                                        : Theme.Palette.textSecondary)
+            }
+
+            Text(env.baseline.historySummary(observationCount: env.observations.count))
+                .font(Theme.Typography.callout)
+                .foregroundStyle(Theme.Palette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let attempt = env.baseline.lastAttempt {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: attempt.outcome.isRecorded
+                          ? "checkmark.circle" : "minus.circle")
+                        .font(.system(size: 14))
+                        .foregroundStyle(attempt.outcome.isRecorded
+                                         ? Theme.Palette.accent : Theme.Palette.textTertiary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(attempt.outcome.label)
+                            .font(Theme.Typography.numericSmall)
+                            .foregroundStyle(Theme.Palette.textPrimary)
+                        if case .recorded(_, _, let temperature) = attempt.outcome,
+                           temperature == nil {
+                            // The one caveat worth repeating every time: without
+                            // a structure temperature this reading cannot be
+                            // temperature-corrected later, and a row of them
+                            // makes the regression look denser than it is.
+                            Text("No structure temperature — this phone has no thermometer "
+                                 + "against the building, so this reading cannot be "
+                                 + "temperature-corrected.")
+                                .font(Theme.Typography.caption)
+                                .foregroundStyle(Theme.Palette.textTertiary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Text(attempt.at.formatted(date: .abbreviated, time: .shortened))
+                            .font(Theme.Typography.caption)
+                            .foregroundStyle(Theme.Palette.textTertiary)
+                    }
+                }
+            }
+
+            HStack(spacing: Theme.Metrics.spacing) {
+                Toggle("Measure automatically", isOn: Binding(
+                    get: { env.baseline.isEnabled },
+                    set: { env.baseline.isEnabled = $0 }))
+                    .font(Theme.Typography.callout)
+                    .tint(Theme.Palette.accent)
+            }
+
+            // A feature that only ever happens at three in the morning is a
+            // feature nobody can be shown, and one nobody can be shown is one
+            // nobody believes. This runs the same code path, now, and says so.
+            Button {
+                env.baseline.measureNow(environment: env)
+                Haptics.shared.play(.selection)
+            } label: {
+                Label("Measure now, ignoring the hour", systemImage: "bolt.badge.clock")
+                    .font(Theme.Typography.callout)
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(SecondaryButtonStyle())
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .instrumentPanel()
+    }
+
+    private var visible: TriaxialRecord {
+        guard record.count > 0 else { return record }
+        let from = max(record.duration - windowSeconds, 0)
+        return TriaxialRecord(x: record.x.slice(from: from, to: record.duration),
+                              y: record.y.slice(from: from, to: record.duration),
+                              z: record.z.slice(from: from, to: record.duration))
+    }
+
+    /// Filters, then decimates to at most `maximumDrawnSamples` per axis.
+    ///
+    /// Decimation is by min/max pairs rather than by picking every nth sample:
+    /// a seismic trace is mostly about its envelope, and plain subsampling
+    /// makes a spike disappear entirely depending on where it happens to fall.
+    private static let maximumDrawnSamples = 900
+
+    private func prepare() {
+        let window = visible
+        guard window.count > 32 else {
+            prepared = window
+            peaks = nil
+            return
+        }
+
+        let source: TriaxialRecord
+        if showsFiltered {
+            let filter = ButterworthFilter(kind: .bandpass, order: 4,
+                                           sampleRate: window.sampleRate,
+                                           lowCutoff: 0.1,
+                                           highCutoff: min(25, window.sampleRate / 2.5))
+            source = TriaxialRecord(x: filter.apply(window.x),
+                                    y: filter.apply(window.y),
+                                    z: filter.apply(window.z))
+        } else {
+            source = window
+        }
+
+        prepared = TriaxialRecord(x: Self.decimated(source.x),
+                                  y: Self.decimated(source.y),
+                                  z: Self.decimated(source.z))
+        peaks = GroundMotion.peaks(window)
+        displayScale = max(max(prepared.x.peakAbsolute,
+                               max(prepared.y.peakAbsolute, prepared.z.peakAbsolute)) * 1.25,
+                           1e-4)
+    }
+
+    private static func decimated(_ waveform: Waveform) -> Waveform {
+        guard waveform.samples.count > maximumDrawnSamples else { return waveform }
+        let bucket = Int((Double(waveform.samples.count)
+                          / Double(maximumDrawnSamples)).rounded(.up))
+        guard bucket > 1 else { return waveform }
+
+        var out: [Double] = []
+        out.reserveCapacity(maximumDrawnSamples + 2)
+        var index = 0
+        while index < waveform.samples.count {
+            let end = min(index + bucket, waveform.samples.count)
+            let slice = waveform.samples[index..<end]
+            // Both extremes of each bucket, in the order they occurred, so the
+            // drawn envelope matches the real one.
+            let lowest = slice.min() ?? 0
+            let highest = slice.max() ?? 0
+            if slice.firstIndex(of: lowest) ?? 0 <= (slice.firstIndex(of: highest) ?? 0) {
+                out.append(lowest); out.append(highest)
+            } else {
+                out.append(highest); out.append(lowest)
+            }
+            index = end
+        }
+        // The rate is now nominal — the chart plots against sample index and the
+        // window length is unchanged, so the time axis still reads correctly.
+        let rate = waveform.sampleRate * Double(out.count)
+            / Double(max(waveform.samples.count, 1))
+        return Waveform(samples: out, sampleRate: max(rate, 1), unit: waveform.unit)
+    }
+
+    private var processed: TriaxialRecord { prepared }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: Theme.Metrics.spacingLoose) {
+                if record.count < 8 {
+                    DesignedEmptyState(
+                        icon: "waveform.path.ecg",
+                        title: "Waiting for data",
+                        message: "The node streams continuously once connected. If nothing "
+                            + "appears within a few seconds, check the connection on the node "
+                            + "screen — or use the simulated node, which needs no hardware.",
+                        actionTitle: "Use the simulated node",
+                        action: {
+                            // Clearing the freeze matters: freezing while the
+                            // trace was empty latched an empty record into
+                            // `frozen`, and since `record` prefers it, the
+                            // screen stayed on this empty state no matter how
+                            // much data arrived — which made this button look
+                            // broken when it had worked perfectly.
+                            frozen = nil
+                            env.attachSimulatedNode()
+                        })
+                        .frame(minHeight: 380)
+                } else {
+                    traces
+                    controls
+                    liveValues
+                    nightlyBaseline
+                    processingChain
+                }
+            }
+            .padding(Theme.Metrics.screenPadding)
+            .contentColumn()
+        }
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    Haptics.shared.play(.selection)
+                    if frozen == nil {
+                        // Only freeze something worth looking at. Freezing an
+                        // empty buffer pins the screen to the empty state.
+                        let current = node.snapshot?.recent
+                        frozen = (current?.count ?? 0) > 8 ? current : nil
+                    } else {
+                        frozen = nil
+                    }
+                } label: {
+                    Label(frozen == nil ? "Freeze" : "Live",
+                          systemImage: frozen == nil ? "pause.circle" : "play.circle")
+                }
+                .tint(frozen == nil ? Theme.Palette.accent : Theme.Palette.verdictAmber)
+                .disabled(frozen == nil && (node.snapshot?.recent.count ?? 0) <= 8)
+                .tutorialAnchor(.monitorFreeze)
+            }
+        }
+        // Re-prepared when the data changes or a control moves — not on every
+        // body evaluation, and not on every sample either.
+        //
+        // The node publishes twenty times a second. Filtering thirty seconds of
+        // three axes is about nine thousand samples of IIR per pass, so doing it
+        // on every revision was nine thousand samples twenty times a second for
+        // a trace that cannot visibly change that fast. Every third revision is
+        // still about seven updates a second, which reads as perfectly live.
+        .task(id: node.revision) { prepare() }
+        .onChange(of: windowSeconds) { _, _ in prepare() }
+        .onChange(of: showsFiltered) { _, _ in prepare() }
+        .onChange(of: frozen == nil) { _, _ in prepare() }
+    }
+
+    private var traces: some View {
+        VStack(alignment: .leading, spacing: Theme.Metrics.spacing) {
+            HStack {
+                SectionLabel("Ground motion", systemImage: "waveform")
+                if frozen != nil {
+                    StatusPill(text: "Frozen", systemImage: "pause.fill",
+                               tint: Theme.Palette.verdictAmber, filled: true)
+                }
+                ConnectionBadge(state: env.connectionState, showsLabel: false)
+            }
+
+            WaveformChart(channels: channels, fixedScale: displayScale, height: 210, unitLabel: "m/s²")
+
+            if let ratio = node.snapshot?.ratio, ratio.count > 8 {
+                TriggerRatioStrip(ratio: ratio, threshold: 4.0)
+            }
+        }
+        .instrumentPanel()
+    }
+
+    private var channels: [WaveformChart.Channel] {
+        let source = processed
+        var out: [WaveformChart.Channel] = []
+        if selectedAxes.contains(.x) {
+            out.append(.init(id: "x", waveform: source.x,
+                             color: Theme.Palette.axisX, label: "N–S"))
+        }
+        if selectedAxes.contains(.y) {
+            out.append(.init(id: "y", waveform: source.y,
+                             color: Theme.Palette.axisY, label: "E–W"))
+        }
+        if selectedAxes.contains(.z) {
+            out.append(.init(id: "z", waveform: source.z,
+                             color: Theme.Palette.axisZ, label: "Vertical", dashed: true))
+        }
+        return out
+    }
+
+    private var controls: some View {
+        VStack(alignment: .leading, spacing: Theme.Metrics.spacing) {
+            SectionLabel("View")
+
+            HStack(spacing: 8) {
+                ForEach(TriaxialRecord.Axis.allCases, id: \.self) { axis in
+                    Button {
+                        Haptics.shared.play(.selection)
+                        if selectedAxes.contains(axis), selectedAxes.count > 1 {
+                            selectedAxes.remove(axis)
+                        } else {
+                            selectedAxes.insert(axis)
+                        }
+                    } label: {
+                        Text(axis.label)
+                            .font(Theme.Typography.label)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 34)
+                    }
+                    .buttonStyle(SecondaryButtonStyle())
+                    .opacity(selectedAxes.contains(axis) ? 1 : 0.45)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Window")
+                        .font(Theme.Typography.label)
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                    Spacer()
+                    Text("\(Int(windowSeconds)) s")
+                        .font(Theme.Typography.numericSmall)
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                }
+                Slider(value: $windowSeconds, in: 5...60, step: 5)
+                    .tint(Theme.Palette.accent)
+            }
+
+            Toggle(isOn: $showsFiltered) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Bandpass filter")
+                        .font(Theme.Typography.callout)
+                    Text("0.1–25 Hz. Removes drift and electrical hash without touching the "
+                         + "seismic band.")
+                        .font(Theme.Typography.caption)
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                }
+            }
+            .tint(Theme.Palette.accent)
+        }
+        .instrumentPanel()
+    }
+
+    private var liveValues: some View {
+        VStack(alignment: .leading, spacing: Theme.Metrics.spacing) {
+            SectionLabel("Live values")
+
+            let peaks = peaks ?? PeakValues(pga: 0, pgv: 0, pgd: 0, pgaTime: 0)
+            ReadoutGrid(readouts: [
+                Readout(label: "Peak acceleration",
+                        value: String(format: "%.4f", peaks.pga / gravity), unit: "g",
+                        tint: Theme.Palette.accent, size: .large),
+                Readout(label: "Intensity",
+                        value: peaks.mercalli.roman,
+                        size: .large,
+                        caption: peaks.mercalli.shortLabel),
+                Readout(label: "Peak velocity",
+                        value: String(format: "%.4f", peaks.pgv), unit: "m/s"),
+                Readout(label: "Peak displacement",
+                        value: String(format: "%.4f", peaks.pgd), unit: "m"),
+            ], columns: 2)
+        }
+        .instrumentPanel()
+    }
+
+    /// The processing chain, laid open.
+    ///
+    /// Anyone can claim their app filters the signal. Showing which stages ran,
+    /// in order, with their settings, is what lets an engineer decide whether to
+    /// believe the number at the end of it.
+    private var processingChain: some View {
+        VStack(alignment: .leading, spacing: Theme.Metrics.spacing) {
+            SectionLabel("Processing chain", systemImage: "gearshape.2")
+
+            ForEach(Array(chainSteps.enumerated()), id: \.offset) { index, step in
+                HStack(alignment: .top, spacing: 10) {
+                    Text("\(index + 1)")
+                        .font(Theme.Typography.numericSmall)
+                        .foregroundStyle(Theme.Palette.accent)
+                        .frame(width: 16)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(step.0)
+                            .font(Theme.Typography.callout.weight(.medium))
+                            .foregroundStyle(Theme.Palette.textPrimary)
+                        Text(step.1)
+                            .font(Theme.Typography.caption)
+                            .foregroundStyle(Theme.Palette.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .instrumentPanel()
+    }
+
+    private var chainSteps: [(String, String)] {
+        var steps: [(String, String)] = [
+            ("Raw samples", "\(Int(record.sampleRate)) Hz, three axes, "
+             + "\(record.count) samples buffered."),
+            ("DC offset removal", "The sensor's resting bias is subtracted, so integration "
+             + "does not run away."),
+        ]
+        if showsFiltered {
+            steps.append(("Butterworth bandpass",
+                          "4th order, 0.1–25 Hz, zero phase. Applied forward and backward so "
+                          + "arrival times are not shifted."))
+        }
+        steps.append(("Recursive STA/LTA",
+                      "0.5 s over 10 s, triggering at 4.0×. This is the same arithmetic the "
+                      + "node runs continuously."))
+        steps.append(("Min/max decimation",
+                      "The trace is reduced to the screen's pixel width while keeping every "
+                      + "peak, so nothing is lost to drawing."))
+        return steps
+    }
+}
+
+#Preview {
+    NavigationStack {
+        MonitorScreen()
+            .seismicBackground()
+            .navigationTitle("Monitor")
+    }
+    .previewEnvironment()
+}

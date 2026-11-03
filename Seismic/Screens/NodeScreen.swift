@@ -1,0 +1,993 @@
+import SwiftUI
+import SeismicCore
+import SeismicSignal
+import SeismicDevice
+
+/// Hardware status, actuators, diagnostics and the power budget.
+struct NodeScreen: View {
+    @EnvironmentObject private var env: AppEnvironment
+    @EnvironmentObject private var node: NodeStream
+    @State private var showingScanner = false
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: Theme.Metrics.spacingLoose) {
+                connection
+                sensorQuality
+                actuatorConsole
+                powerBudget
+                sensors
+                corroboration
+                diagnostics
+                demoControls
+                logView
+            }
+            .padding(Theme.Metrics.screenPadding)
+            .contentColumn()
+        }
+        .sheet(isPresented: $showingScanner) { NodeScannerSheet() }
+    }
+
+    // MARK: Connection
+
+    private var connection: some View {
+        VStack(alignment: .leading, spacing: Theme.Metrics.spacing) {
+            HStack {
+                SectionLabel("Connection", systemImage: "antenna.radiowaves.left.and.right")
+                ConnectionBadge(state: env.connectionState)
+            }
+
+            if let snapshot = node.snapshot {
+                ReadoutGrid(readouts: [
+                    Readout(label: "Node", value: snapshot.nodeName, size: .small),
+                    Readout(label: "State", value: snapshot.telemetry.state.label, size: .small),
+                    Readout(label: "Dropped batches", value: "\(env.session.droppedBatches)",
+                            size: .small),
+                    Readout(label: "Buffered samples", value: "\(snapshot.recent.count)",
+                            size: .small),
+                ], columns: 2)
+
+                if let progress = snapshot.transferProgress {
+                    VStack(alignment: .leading, spacing: 5) {
+                        MeaningfulProgress(
+                            title: "Transferring a recording",
+                            detail: snapshot.transferSummary,
+                            progress: progress)
+                    }
+                }
+            }
+
+            sourcePicker
+
+            HStack(spacing: Theme.Metrics.spacing) {
+                Button {
+                    showingScanner = true
+                } label: {
+                    Label("Scan for hardware", systemImage: "dot.radiowaves.left.and.right")
+                        .font(Theme.Typography.callout)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: Theme.Metrics.minimumTapTarget)
+                }
+                .buttonStyle(SecondaryButtonStyle())
+
+                Button {
+                    env.attachSimulatedNode()
+                } label: {
+                    Label("Use simulator", systemImage: "cpu")
+                        .font(Theme.Typography.callout)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: Theme.Metrics.minimumTapTarget)
+                }
+                .buttonStyle(SecondaryButtonStyle())
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .instrumentPanel()
+    }
+
+    // MARK: Where the motion comes from
+
+    /// The three sources, in the order they deserve.
+    ///
+    /// A node first, because it is genuinely the best one and the app should
+    /// say so rather than treat all three as equivalent choices. The note under
+    /// each is the real difference, not a feature list — somebody picking the
+    /// phone should know exactly what they are giving up before the first
+    /// verdict rather than after it.
+    private var sourcePicker: some View {
+        VStack(alignment: .leading, spacing: Theme.Metrics.spacingTight) {
+            Text("WHERE THE MOTION COMES FROM")
+                .font(Theme.Typography.label)
+                .tracking(1.1)
+                .foregroundStyle(Theme.Palette.textTertiary)
+
+            ForEach(AppEnvironment.SensorSource.allCases) { source in
+                sourceRow(source)
+            }
+        }
+        .padding(.top, Theme.Metrics.spacingTight)
+    }
+
+    private func sourceRow(_ source: AppEnvironment.SensorSource) -> some View {
+        let isActive = env.sensorSource == source
+        let isAvailable = source != .phone || PhoneSensorTransport.isAvailable
+        return Button {
+            switch source {
+            case .node: showingScanner = true
+            case .phone: env.attachPhoneSensor()
+            case .simulated: env.attachSimulatedNode()
+            }
+            Haptics.shared.play(.selection)
+        } label: {
+            HStack(alignment: .top, spacing: Theme.Metrics.spacing) {
+                Image(systemName: isActive ? "largecircle.fill.circle" : "circle")
+                    .font(.system(size: 18))
+                    .foregroundStyle(isActive ? Theme.Palette.accent : Theme.Palette.textGhost)
+                    .padding(.top, 1)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Label(source.title, systemImage: source.systemImage)
+                            .font(Theme.Typography.headline)
+                            .foregroundStyle(Theme.Palette.textPrimary)
+                        if source == .node {
+                            Text("MOST ACCURATE")
+                                .font(.system(size: 9, weight: .bold))
+                                .tracking(0.6)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Theme.Palette.accentDim,
+                                            in: Capsule(style: .continuous))
+                                .foregroundStyle(Theme.Palette.accent)
+                        }
+                    }
+                    Text(isAvailable ? source.accuracyNote
+                                     : "This device has no motion sensor available to the app.")
+                        .font(Theme.Typography.caption)
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .multilineTextAlignment(.leading)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, Theme.Metrics.spacingTight)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!isAvailable)
+        .opacity(isAvailable ? 1 : 0.45)
+    }
+
+    // MARK: Sensor quality
+
+    /// Whether this sensor can actually resolve this building.
+    ///
+    /// The question only became askable when the app started offering a phone
+    /// as a sensor, and it is not rhetorical: a phone in a stiff two-storey
+    /// house is being asked to see a few micro-g of sway, which may genuinely
+    /// be below its own noise floor. Answering it with an opinion would be
+    /// worthless, so it is answered with an Allan deviation curve — the
+    /// standard way of separating a sensor's noise processes — and the floor of
+    /// that curve is compared against the building's expected amplitude.
+    ///
+    /// The comparison is what makes it useful. A noise floor on its own is a
+    /// number; a noise floor next to what the building actually does is a
+    /// verdict on whether to trust anything else on this screen.
+    private var sensorQuality: some View {
+        VStack(alignment: .leading, spacing: Theme.Metrics.spacing) {
+            SectionLabel("Sensor quality", systemImage: "gauge.with.dots.needle.bottom.50percent")
+
+            if let characterisation, let record = qualityRecord {
+                let expected = expectedAmplitude
+                let resolution = characterisation.canResolve(expected)
+
+                ReadoutGrid(readouts: [
+                    Readout(label: "Noise floor",
+                            value: String(format: "%.5f", characterisation.biasInstability),
+                            unit: "m/s²", size: .small),
+                    Readout(label: "Best averaged over",
+                            value: String(format: "%.1f", characterisation.optimalAveragingTime),
+                            unit: "s", size: .small),
+                    Readout(label: "Building's motion",
+                            value: String(format: "%.5f", expected),
+                            unit: "m/s²", size: .small),
+                    Readout(label: "Margin",
+                            value: resolution.margin > 999 ? "≫"
+                                 : String(format: "%.1f", resolution.margin),
+                            unit: "×",
+                            tint: resolution.verdict == .hopeless
+                                ? Theme.Palette.verdictAmber : Theme.Palette.accent,
+                            size: .small),
+                ], columns: 2)
+
+                InlineNotice(
+                    level: resolution.verdict == .hopeless ? .warning : .info,
+                    title: resolution.verdict.rawValue.capitalized,
+                    message: resolution.verdict.explanation)
+
+                Text("Allan deviation measures how much the average of the signal changes "
+                     + "between adjacent windows as the windows get longer. White noise falls "
+                     + "away as you average; drift does not, so the curve has a floor. That "
+                     + "floor is the best this sensor can ever do, and the time it occurs at "
+                     + "is how long a measurement is worth taking for. "
+                     + String(format: "Measured over %.0f s of buffered data.",
+                              record.duration))
+                    .font(Theme.Typography.caption)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("Needs a few seconds of buffered data to characterise the sensor. This "
+                     + "fills in on its own.")
+                    .font(Theme.Typography.caption)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .instrumentPanel()
+    }
+
+    /// The buffered record the characterisation is computed from.
+    private var qualityRecord: TriaxialRecord? {
+        guard let snapshot = node.snapshot, snapshot.recent.count > 2_000 else { return nil }
+        return snapshot.recent
+    }
+
+    private var characterisation: AllanVariance.Characterisation? {
+        guard let record = qualityRecord else { return nil }
+        return AllanVariance.compute(record.dominantHorizontal)
+    }
+
+    /// Roughly how hard the building shakes its own sensor at rest.
+    ///
+    /// Taken from the ambient RMS the node already reports rather than from a
+    /// model, because the whole point of the comparison is to test the sensor
+    /// against this building rather than against a typical one.
+    private var expectedAmplitude: Double {
+        node.snapshot?.telemetry.ambientVibrationRMS ?? 0
+    }
+
+    // MARK: Actuators
+
+    private var actuatorConsole: some View {
+        VStack(alignment: .leading, spacing: Theme.Metrics.spacing) {
+            SectionLabel("Safety actuators", systemImage: "bolt.shield")
+
+            ForEach(ActuatorKind.allCases) { kind in
+                let report = node.snapshot?.actuators[kind]
+                ActuatorRow(kind: kind, report: report) { command in
+                    env.session.send(command)
+                    Haptics.shared.play(.actuatorFired)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .instrumentPanel()
+    }
+
+    // MARK: Power
+
+    /// The USB constraint, presented as the engineering feature it is.
+    private var powerBudget: some View {
+        let budget = PowerBudget.usb2
+        let planner = ActuationPlanner(budget: budget)
+        let steps = planner.plan(ActuatorKind.allCases)
+        let draw = node.snapshot?.telemetry.activeCurrentDraw_mA ?? budget.quiescent
+
+        return VStack(alignment: .leading, spacing: Theme.Metrics.spacing) {
+            SectionLabel("Power budget", systemImage: "bolt")
+
+            VStack(alignment: .leading, spacing: 6) {
+                GeometryReader { geometry in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Theme.Palette.surfaceHighest)
+                        Capsule()
+                            .fill(draw > budget.supply - budget.reserve
+                                  ? Theme.Palette.verdictRed : Theme.Palette.accent)
+                            .frame(width: geometry.size.width
+                                   * CGFloat(min(draw / budget.supply, 1)))
+                    }
+                }
+                .frame(height: 8)
+
+                HStack {
+                    Text("\(Int(draw)) mA drawn")
+                    Spacer()
+                    Text("\(Int(budget.supply)) mA available")
+                }
+                .font(Theme.Typography.numericSmall)
+                .foregroundStyle(Theme.Palette.textSecondary)
+            }
+
+            Text(budget.explanation)
+                .font(Theme.Typography.caption)
+                .foregroundStyle(Theme.Palette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Divider().background(Theme.Palette.hairline)
+
+            Text("FIRING SEQUENCE")
+                .font(Theme.Typography.label)
+                .tracking(1)
+                .foregroundStyle(Theme.Palette.textTertiary)
+
+            ForEach(steps) { step in
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack {
+                        Image(systemName: step.kind.systemImage)
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.Palette.accent)
+                        Text(step.kind.actionVerb)
+                            .font(Theme.Typography.callout)
+                            .foregroundStyle(Theme.Palette.textPrimary)
+                        Spacer()
+                        Text(String(format: "t+%.1f s · %.1f s · %d mA",
+                                    step.startOffset, step.duration, Int(step.currentDraw)))
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(Theme.Palette.textTertiary)
+                    }
+                    Text(step.reason)
+                        .font(Theme.Typography.caption)
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .instrumentPanel()
+    }
+
+    // MARK: Sensors
+
+    private var sensors: some View {
+        VStack(alignment: .leading, spacing: Theme.Metrics.spacing) {
+            SectionLabel("Sensors", systemImage: "sensor")
+
+            if let telemetry = node.snapshot?.telemetry {
+                ReadoutGrid(readouts: [
+                    Readout(label: "Board temp",
+                            value: String(format: "%.1f", telemetry.boardTemperature), unit: "°C",
+                            size: .small),
+                    Readout(label: "Structure temp",
+                            value: String(format: "%.1f", telemetry.structureTemperature),
+                            unit: "°C", size: .small),
+                    Readout(label: "Residual displacement",
+                            value: String(format: "%.1f", telemetry.residualDisplacement * 1000),
+                            unit: "mm",
+                            tint: telemetry.residualDisplacement > 0.005
+                                ? Theme.Palette.verdictAmber : Theme.Palette.textPrimary,
+                            size: .small),
+                    Readout(label: "Tilt",
+                            value: String(format: "%.2f", telemetry.tiltAngle), unit: "°",
+                            tint: telemetry.permanentTilt ? Theme.Palette.verdictRed
+                                                          : Theme.Palette.textPrimary,
+                            size: .small),
+                ], columns: 2)
+
+                Divider().background(Theme.Palette.hairline)
+
+                stateRow("Grid power", telemetry.gridPowerPresent, trueLabel: "Present",
+                         falseLabel: "Lost", trueIsGood: true)
+                stateRow("Water", telemetry.waterDetected, trueLabel: "Detected",
+                         falseLabel: "Dry", trueIsGood: false)
+                stateRow("Occupancy", telemetry.occupancyDetected, trueLabel: "Occupied",
+                         falseLabel: "Empty", trueIsGood: true, neutral: true)
+                stateRow("Permanent tilt", telemetry.permanentTilt, trueLabel: "Latched",
+                         falseLabel: "Level", trueIsGood: false)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .instrumentPanel()
+    }
+
+    private func stateRow(_ label: String, _ value: Bool, trueLabel: String,
+                          falseLabel: String, trueIsGood: Bool,
+                          neutral: Bool = false) -> some View {
+        let good = neutral ? true : (value == trueIsGood)
+        return HStack {
+            Text(label)
+                .font(Theme.Typography.callout)
+                .foregroundStyle(Theme.Palette.textSecondary)
+            Spacer()
+            StatusPill(text: value ? trueLabel : falseLabel,
+                       systemImage: good ? "checkmark" : "exclamationmark",
+                       tint: neutral ? Theme.Palette.textSecondary
+                           : (good ? Theme.Palette.verdictGreen : Theme.Palette.verdictAmber))
+        }
+    }
+
+    /// Why the node believed it.
+    ///
+    /// A single accelerometer crossing a threshold is not evidence — a slammed
+    /// door does that. The node only accepts a trigger when independent
+    /// channels agree, and this is where that vote is shown, including the
+    /// channels that dissented. A system that fires the gas valve on one
+    /// sensor's opinion is a system nobody will leave switched on.
+    private var corroboration: some View {
+        let votes = node.snapshot?.votes ?? []
+        let decision = SensorFusion.vote(votes)
+
+        return VStack(alignment: .leading, spacing: Theme.Metrics.spacing) {
+            SectionLabel("Corroboration", systemImage: "person.3.sequence",
+                         trailing: votes.isEmpty ? "No vote yet"
+                                                 : (decision.accepted ? "Accepted" : "Rejected"))
+
+            if votes.isEmpty {
+                Text("Nothing has triggered, so there is no vote to show. After an event this "
+                     + "lists every channel that agreed and every one that did not.")
+                    .font(Theme.Typography.caption)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                HStack(spacing: 10) {
+                    Image(systemName: decision.accepted
+                          ? "checkmark.shield.fill" : "xmark.shield.fill")
+                        .font(.system(size: 18))
+                        .foregroundStyle(decision.accepted ? Theme.Palette.verdictAmber
+                                                           : Theme.Palette.textSecondary)
+                    Text(decision.explanation)
+                        .font(Theme.Typography.callout)
+                        .foregroundStyle(Theme.Palette.textPrimary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                ForEach(votes) { vote in
+                    HStack(spacing: 8) {
+                        Image(systemName: vote.agreed ? "checkmark.circle.fill" : "circle")
+                            .font(.system(size: 12))
+                            .foregroundStyle(vote.agreed ? Theme.Palette.accent
+                                                         : Theme.Palette.textTertiary)
+                        Text(vote.channel.label)
+                            .font(Theme.Typography.caption)
+                            .foregroundStyle(Theme.Palette.textSecondary)
+                        Spacer()
+                        Text(String(format: "%.2f", vote.value))
+                            .font(Theme.Typography.numericSmall)
+                            .foregroundStyle(Theme.Palette.textTertiary)
+                    }
+                }
+
+                Readout(label: "Confidence",
+                        value: String(format: "%.0f", decision.confidence * 100), unit: "%",
+                        size: .small,
+                        caption: "\(decision.agreeing.count) agreeing, "
+                               + "\(decision.dissenting.count) dissenting")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .instrumentPanel()
+    }
+
+    // MARK: Diagnostics
+
+    private var diagnostics: some View {
+        VStack(alignment: .leading, spacing: Theme.Metrics.spacing) {
+            SectionLabel("Diagnostics", systemImage: "stethoscope")
+
+            HStack(spacing: Theme.Metrics.spacing) {
+                Button {
+                    env.session.send(.selfTest)
+                } label: {
+                    Label("Self-test", systemImage: "checkmark.circle")
+                        .font(Theme.Typography.callout)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: Theme.Metrics.minimumTapTarget)
+                }
+                .buttonStyle(SecondaryButtonStyle())
+
+                Button {
+                    env.session.send(.calibrateBaseline)
+                } label: {
+                    Label("Calibrate", systemImage: "scope")
+                        .font(Theme.Typography.callout)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: Theme.Metrics.minimumTapTarget)
+                }
+                .buttonStyle(SecondaryButtonStyle())
+            }
+
+            if let result = node.lastSelfTest {
+                HStack(spacing: 6) {
+                    Image(systemName: result.passed ? "checkmark.seal.fill"
+                                                    : "exclamationmark.triangle.fill")
+                        .foregroundStyle(result.passed ? Theme.Palette.verdictGreen
+                                                       : Theme.Palette.verdictAmber)
+                    Text(result.summary)
+                        .font(Theme.Typography.callout)
+                        .foregroundStyle(Theme.Palette.textPrimary)
+                }
+
+                ForEach(result.checks) { check in
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: check.passed ? "checkmark" : "xmark")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(check.passed ? Theme.Palette.verdictGreen
+                                                          : Theme.Palette.verdictRed)
+                            .frame(width: 14)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(check.name)
+                                .font(Theme.Typography.caption.weight(.medium))
+                                .foregroundStyle(Theme.Palette.textPrimary)
+                            Text(check.detail)
+                                .font(Theme.Typography.caption)
+                                .foregroundStyle(Theme.Palette.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+            }
+
+            NavigationLink {
+                AlgorithmCatalogScreen()
+                    .seismicBackground()
+                    .navigationTitle("Algorithms")
+            } label: {
+                HStack {
+                    Text("Algorithm catalogue")
+                    Spacer()
+                    Text("\(AlgorithmCatalog.all.count)")
+                        .font(Theme.Typography.numericSmall)
+                    Image(systemName: "chevron.right").font(.caption.weight(.semibold))
+                }
+                .font(Theme.Typography.callout)
+                .foregroundStyle(Theme.Palette.accent)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .instrumentPanel()
+    }
+
+    // MARK: Demo
+
+    /// Explicit demonstration controls.
+    ///
+    /// Present and labelled rather than hidden behind a debug flag, because the
+    /// product is meant to be shown to somebody with no hardware, and hunting
+    /// for a secret gesture during a demonstration is a bad look.
+    private var demoControls: some View {
+        VStack(alignment: .leading, spacing: Theme.Metrics.spacing) {
+            SectionLabel("Demonstration", systemImage: "play.rectangle")
+
+            Text("These inject simulated conditions so every feature can be seen without "
+                 + "waiting for a real earthquake.")
+                .font(Theme.Typography.caption)
+                .foregroundStyle(Theme.Palette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            demoButton("Simulate a magnitude 6.4 nearby", "waveform.badge.exclamationmark") {
+                env.simulateEarthquake(magnitude: 6.4, distanceKm: 22)
+            }
+            demoButton("Simulate a distant magnitude 7.4", "globe") {
+                env.simulateEarthquake(magnitude: 7.4, distanceKm: 140)
+            }
+            demoButton("Introduce structural damage", "bandage") {
+                env.introduceSimulatedDamage()
+            }
+            demoButton("Drop the connection mid-event", "wifi.slash") {
+                env.simulateConnectionLoss()
+            }
+            demoButton("Restore the connection", "wifi") {
+                env.restoreConnection()
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .instrumentPanel()
+    }
+
+    private func demoButton(_ title: String, _ icon: String,
+                            action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: icon)
+                .font(Theme.Typography.callout)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(height: 42)
+                .padding(.horizontal, 12)
+        }
+        .buttonStyle(SecondaryButtonStyle())
+    }
+
+    private var logView: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            SectionLabel("Node log", trailing: "\(node.log.count) lines")
+
+            if node.log.isEmpty {
+                Text("Nothing logged yet.")
+                    .font(Theme.Typography.caption)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+            } else {
+                ForEach(node.log.prefix(25)) { line in
+                    HStack(alignment: .top, spacing: 8) {
+                        Text(line.at.formatted(date: .omitted, time: .standard))
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(Theme.Palette.textTertiary)
+                        Text(line.text)
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.Palette.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .instrumentPanel()
+    }
+}
+
+/// One actuator, with its state and how it was confirmed.
+struct ActuatorRow: View {
+    let kind: ActuatorKind
+    let report: ActuatorReport?
+    let send: (NodeCommand) -> Void
+
+    private var state: ActuatorState { report?.state ?? .idle }
+
+    private var tint: Color {
+        switch state {
+        case .confirmed: Theme.Palette.verdictGreen
+        case .failed: Theme.Palette.verdictRed
+        case .inProgress, .commanded, .queued: Theme.Palette.verdictAmber
+        default: Theme.Palette.textSecondary
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Image(systemName: kind.systemImage)
+                    .font(.system(size: 15))
+                    .foregroundStyle(tint)
+                    .frame(width: 22)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(kind.label)
+                        .font(Theme.Typography.callout.weight(.medium))
+                        .foregroundStyle(Theme.Palette.textPrimary)
+                        .lineLimit(1)
+                    Text(state.label)
+                        .font(Theme.Typography.caption)
+                        .foregroundStyle(tint)
+                        .lineLimit(1)
+                }
+                // The name yields when the row is tight; the buttons do not.
+                .layoutPriority(-1)
+
+                Spacer(minLength: 0)
+
+                // The padding belongs to the *label*, not to the button.
+                //
+                // Applied outside `buttonStyle` it lands outside the style's
+                // background instead of inside it, so the filled chip hugged
+                // the word and the padding became invisible dead space around
+                // it. These are the controls that shut off somebody's gas
+                // supply; they get a full 44pt target like everything else.
+                // No padding or height of their own: `SecondaryButtonStyle`
+                // already applies both, and adding a second helping made each of
+                // these chips about 93pt wide. Two of those plus the icon left
+                // roughly 77pt for the name, which is why "Mains power" arrived
+                // as "Mains po…" and, before `lineLimit`, why "Fire" itself was
+                // broken across two lines as "Fir/e". A control that shuts off a
+                // gas supply cannot be allowed to become unreadable because the
+                // label beside it is long.
+                Button { send(.fireActuator(kind)) } label: {
+                    Text("Fire")
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                .buttonStyle(SecondaryButtonStyle())
+
+                Button { send(.resetActuator(kind)) } label: {
+                    Text("Reset")
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                .buttonStyle(SecondaryButtonStyle())
+            }
+
+            // How it was confirmed matters more than that it was commanded.
+            // A command with no independent confirmation is a rumour.
+            HStack(spacing: 5) {
+                Image(systemName: state == .confirmed ? "checkmark.seal.fill" : "questionmark.circle")
+                    .font(.system(size: 10))
+                Text(state == .confirmed
+                     ? kind.confirmation.label
+                     : "Will be confirmed by: \(kind.confirmation.label.lowercased())")
+                    .font(Theme.Typography.caption)
+            }
+            .foregroundStyle(state == .confirmed ? Theme.Palette.verdictGreen
+                                                 : Theme.Palette.textTertiary)
+
+            if let reason = report?.failureReason {
+                Text(reason)
+                    .font(Theme.Typography.caption)
+                    .foregroundStyle(Theme.Palette.verdictRed)
+            }
+            if let elapsed = report?.elapsed {
+                Text(String(format: "Completed in %.2f s", elapsed))
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(Theme.Palette.textTertiary)
+            }
+        }
+        .padding(.vertical, 6)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// Choosing what the app listens to: a real board over Bluetooth, this phone,
+/// or the simulator.
+///
+/// It used to scan through whatever transport happened to be attached, which
+/// at launch is the simulator — so the only thing it could ever list was the
+/// simulated node, and there was no route from here to real hardware at all.
+/// It now drives the Bluetooth radio directly and lists what is actually
+/// nearby.
+struct NodeScannerSheet: View {
+    @EnvironmentObject private var env: AppEnvironment
+    @Environment(\.dismiss) private var dismiss
+    @State private var isScanning = false
+
+    private var link: SeismicNodeLink { env.link }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: Theme.Metrics.s5) {
+                    if isScanning {
+                        // A separate view so the link is *observed*. Reading
+                        // `env.link.discovered` from here would never redraw:
+                        // the link is its own ObservableObject, and a change
+                        // inside it does not republish the environment holding
+                        // it — so the list would stay empty while devices
+                        // arrived.
+                        BluetoothDeviceList(link: link) { id in
+                            env.connectToHardwareNode(id)
+                            dismiss()
+                        }
+                    } else {
+                        invitation
+                    }
+                    otherSources
+                }
+                .padding(Theme.Metrics.screenPadding)
+                .contentColumn()
+            }
+            .seismicBackground()
+            .navigationTitle("Find a node")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { link.stopScanning(); dismiss() }
+                }
+                if isScanning {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button("Scan again") { link.startScanning() }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: Asking first
+
+    /// Bluetooth is not started until somebody asks for it.
+    ///
+    /// Scanning on appearance would put the system's Bluetooth permission
+    /// prompt in front of a person who opened this screen to pick the
+    /// simulator, and a permission asked for before the reason is visible is a
+    /// permission that gets denied once and for ever.
+    private var invitation: some View {
+        VStack(alignment: .leading, spacing: Theme.Metrics.s4) {
+            SectionLabel("Your node", systemImage: "sensor.tag.radiowaves.forward")
+
+            Text("The seismic node talks to this phone over Bluetooth. Power the board up, "
+                 + "check the small blue module on it is blinking rather than lit steadily — "
+                 + "steady means it is already paired to something else — and then look for it.")
+                .font(Theme.Typography.callout)
+                .foregroundStyle(Theme.Palette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Button {
+                isScanning = true
+                link.startScanning()
+            } label: {
+                Label("Connect to a Bluetooth device", systemImage: "dot.radiowaves.left.and.right")
+                    .font(Theme.Typography.headline)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 54)
+            }
+            .buttonStyle(PrimaryButtonStyle())
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .instrumentPanel()
+    }
+
+    // MARK: The alternatives
+
+    private var otherSources: some View {
+        VStack(alignment: .leading, spacing: Theme.Metrics.s4) {
+            SectionLabel("No hardware to hand", systemImage: "iphone.gen3")
+
+            Text("Both of these are complete. The phone's own accelerometer is a real "
+                 + "instrument and everything derived from it is real; the simulator is "
+                 + "physically realistic and is marked as synthetic everywhere it appears.")
+                .font(Theme.Typography.callout)
+                .foregroundStyle(Theme.Palette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Button {
+                env.attachPhoneSensor()
+                dismiss()
+            } label: {
+                Label("Use this phone's accelerometer", systemImage: "iphone.gen3")
+                    .font(Theme.Typography.callout)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: Theme.Metrics.minimumTapTarget)
+            }
+            .buttonStyle(SecondaryButtonStyle())
+
+            Button {
+                env.attachSimulatedNode()
+                dismiss()
+            } label: {
+                Label("Use the simulated node", systemImage: "cpu")
+                    .font(Theme.Typography.callout)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: Theme.Metrics.minimumTapTarget)
+            }
+            .buttonStyle(SecondaryButtonStyle())
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .instrumentPanel()
+    }
+}
+
+/// The list of what the radio can see, observing the link so it updates.
+struct BluetoothDeviceList: View {
+    @ObservedObject var link: SeismicNodeLink
+    let onPick: (UUID) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Metrics.s4) {
+            HStack {
+                SectionLabel("Bluetooth devices", systemImage: "dot.radiowaves.left.and.right")
+                Spacer()
+                if link.connection == .scanning {
+                    ProgressView().controlSize(.small)
+                }
+            }
+
+            if link.discovered.isEmpty {
+                Text(link.connection == .scanning
+                     ? "Looking. Everything nearby will be listed — these serial modules "
+                       + "usually advertise a name and nothing else, so the node cannot be "
+                       + "picked out from the advertisement alone."
+                     : "Nothing found.")
+                    .font(Theme.Typography.callout)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            ForEach(link.discovered.sorted { $0.sortKey > $1.sortKey }) { device in
+                Button { onPick(device.id) } label: { row(device) }
+                    .buttonStyle(.plain)
+                    .disabled(!device.isConnectable)
+            }
+
+            if let fault = link.log.first(where: { $0.kind == .fault }) {
+                Text(fault.text)
+                    .font(Theme.Typography.caption)
+                    .foregroundStyle(Theme.Palette.verdictAmber)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .instrumentPanel()
+    }
+
+    private func row(_ device: SeismicNodeLink.DiscoveredPeripheral) -> some View {
+        HStack(spacing: Theme.Metrics.s4) {
+            Image(systemName: device.advertisesNodeService
+                  ? "sensor.tag.radiowaves.forward" : "dot.radiowaves.left.and.right")
+                .font(.title3)
+                .foregroundStyle(Theme.Palette.accent)
+                .frame(width: 28)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(device.name)
+                    .font(Theme.Typography.headline)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Text("\(device.rssi) dBm · \(device.signalBars)/4 bars")
+                    .font(Theme.Typography.caption)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+            }
+            Spacer(minLength: 0)
+            if device.advertisesNodeService {
+                StatusPill(text: "LIKELY", tint: Theme.Palette.accent)
+            }
+        }
+        .padding(.vertical, Theme.Metrics.s2)
+        .contentShape(Rectangle())
+    }
+}
+
+/// Every algorithm, and where its output appears. Tapping one explains it.
+struct AlgorithmCatalogScreen: View {
+    @State private var family: AlgorithmEntry.Family?
+
+    private var entries: [AlgorithmEntry] {
+        guard let family else { return AlgorithmCatalog.all }
+        return AlgorithmCatalog.family(family)
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: Theme.Metrics.spacing) {
+                Text("Every algorithm in the system, and where you can see its output. "
+                     + "\(AlgorithmCatalog.countedAlgorithms) of these are the core set; the "
+                     + "rest are the supporting infrastructure they need.")
+                    .font(Theme.Typography.caption)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        chip("All", isSelected: family == nil) { family = nil }
+                        ForEach(AlgorithmEntry.Family.allCases) { candidate in
+                            chip(candidate.rawValue, isSelected: family == candidate) {
+                                family = candidate
+                            }
+                        }
+                    }
+                }
+
+                ForEach(entries) { entry in
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack(spacing: 8) {
+                            Text("\(entry.number)")
+                                .font(Theme.Typography.numericSmall)
+                                .foregroundStyle(Theme.Palette.accent)
+                                .frame(width: 24, alignment: .trailing)
+                            Text(entry.name)
+                                .font(Theme.Typography.callout.weight(.medium))
+                                .foregroundStyle(Theme.Palette.textPrimary)
+                        }
+                        Text(entry.purpose)
+                            .font(Theme.Typography.caption)
+                            .foregroundStyle(Theme.Palette.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        HStack(spacing: 4) {
+                            Image(systemName: "eye")
+                                .font(.system(size: 9))
+                            Text(entry.surfacedAt)
+                                .font(.system(size: 10))
+                        }
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .instrumentPanel(padding: 12)
+                }
+            }
+            .padding(Theme.Metrics.screenPadding)
+            .contentColumn()
+        }
+    }
+
+    private func chip(_ title: String, isSelected: Bool,
+                      action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(Theme.Typography.label)
+                .padding(.horizontal, 11).padding(.vertical, 7)
+        }
+        .buttonStyle(SecondaryButtonStyle())
+        .opacity(isSelected ? 1 : 0.5)
+    }
+}
+
+#Preview {
+    NavigationStack {
+        NodeScreen()
+            .seismicBackground()
+            .navigationTitle("Node")
+    }
+    .previewEnvironment()
+}

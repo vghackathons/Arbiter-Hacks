@@ -1,0 +1,265 @@
+# Seismic
+
+A native iOS app that warns before an earthquake's destructive wave arrives, acts
+to make a building safe, measures whether that building's structural behaviour
+changed, and lets anyone pull a real building into a 3D simulator and shake it
+with a real earthquake record.
+
+## Opening it
+
+```
+open Seismic.xcodeproj
+```
+
+Select the **Seismic** scheme and run. There is nothing to configure: no
+hardware, no API keys, no network. The app seeds itself on first launch with a
+library of real buildings, ten historic earthquake records, a year of synthetic
+measurement history and a populated community map, and it connects to a
+simulated seismic node that generates physically realistic data.
+
+Requires Xcode 16 or later and iOS 17+.
+
+### Running the tests
+
+```
+cd SeismicKit && swift test
+```
+
+966 tests across seven modules. Every one of the seventy-four algorithms is
+tested against a known input with an expected output, and every network client
+is tested against a stubbed transport — including the paths that fail, which are
+the ones that matter and the ones a live-network test would never reach
+reliably.
+
+Several of those tests exist to record a *limitation* rather than a capability:
+that COMAC cannot see a uniform amplitude change at one storey, that a matched
+filter's detection margin for a buried event is about five times the noise
+scatter and not more, that a mid-range outlier barely moves a least-squares fit
+while one at the end of the range wrecks it. Each was written after the obvious
+version of the test failed and the honest explanation turned out to be more
+interesting than the assertion.
+
+## What is here
+
+```
+Seismic.xcodeproj        The app target (file-system synchronised — new files
+                         are picked up without editing the project)
+Seismic/                 SwiftUI app: design system, charts, 3D simulator, screens
+SeismicKit/              All logic, as a multi-module Swift package
+  SeismicCore            Units, domain types, secrets, shared maths
+  SeismicSignal          Conditioning, detection, spectra, modal identification
+  SeismicGeo             Location, network inversion, spatial indexing, geometry
+  SeismicStructures      The solver, the assessment, capacity and performance
+  SeismicDevice          The Arduino wire protocol, chunked transfer, the
+                         simulated node
+  SeismicData            Persistence, seed library, tamper-evident ledger, sync
+  SeismicServices        HTTP with backoff, the AI analyst, retrieval, cloud
+SeismicWidgets/          Home-screen widget and the Live Activity
+.env.example             Every environment variable, with its purpose and what
+                         happens when it is absent
+```
+
+Nothing in `SeismicKit` imports SwiftUI, so all of it is testable on any machine
+without a simulator.
+
+## The idea
+
+A building sways at a natural period set by its stiffness. Damage reduces
+stiffness, so the period lengthens — typically 10–30% for significant damage,
+which is a large and measurable change.
+
+The difficulty is that temperature moves it by a few per cent too. Cold concrete
+is stiffer, so a building genuinely sways faster on a January morning than on a
+July afternoon, by about as much as real damage would. A system that ignored
+that would cry wolf every winter, and after two false alarms nobody would
+believe the true one. So the measured period is normalised against a
+temperature-frequency regression fitted to that specific building's own history,
+with outlier rejection — and the result is cross-checked against residual
+displacement and permanent tilt, which temperature cannot explain away.
+
+## Configuration
+
+During development a `.env` at the repository root is copied into the app
+bundle by a build phase, so the vault finds it on first launch. **Debug builds
+only** — a release build never carries it, and any stale copy from a previous
+debug build is removed. On a real device you can also drop a `.env` into the
+app's documents directory through the Files app without rebuilding.
+
+
+Every credential loads from `.env`, which is gitignored. `.env.example` lists
+all of them with a one-line purpose. **None is required.** Each key upgrades one
+simulated path to a live one; without it the app uses a bundled or on-device
+fallback that works completely. Settings → API Keys can paste, replace, test or
+clear any key, and shows per-key status. Keys typed there override `.env`.
+
+Three services are used that need no key at all, which is worth saying plainly
+because the opposite is usually assumed: the USGS earthquake feed, USGS
+aftershock forecasts, and OpenStreetMap tiles.
+
+## The parts that are easy to miss
+
+**The working is shown.** Analysis is a whole screen of it: the Welch spectrum a
+period was picked off, with the smoothing as a toggle rather than a silent
+default; the peaks and their prominences; three independent period estimates
+side by side; the Hilbert envelope the damping was fitted to; a response
+spectrum with your building's period marked on it; and a spectrogram, where a
+building that softens during an earthquake shows it as a bright band sliding
+downwards.
+
+
+**The analyst cannot invent a number.** Any answer it produces is checked
+against the facts it was given; a numeric token that appears nowhere in them
+means the whole answer is discarded and the deterministic on-device narrator is
+used instead, with the substitution stated on screen. A fluent paragraph
+containing a measurement nobody took is the one failure this app cannot ship.
+
+**You can hear a building.** Its period is transposed up six octaves — a pure
+multiplication, so every ratio survives — and played. Play the before and after
+periods together and the change stops being a percentage: two tones nine hertz
+apart beat against each other nine times a second, and you hear the damage as a
+throb. People who cannot read a spectrum trust their own ears immediately.
+
+**The Live Activity is the real interface.** Nobody unlocks a phone and finds an
+app during an earthquake. The countdown, the instruction and eventually the
+verdict appear on the Lock Screen and in the Dynamic Island, and the sequence is
+ended deliberately with the verdict left visible for five minutes afterwards.
+
+**The network screen demonstrates its own failure.** Three sensors in a line
+produce a confident-looking epicentre in the wrong place. There is a button that
+does exactly that, beside the button that does it properly, and the azimuthal
+gap is the number that gives the bad one away.
+
+**Nothing needs a key.** Wikidata, OpenStreetMap and the USGS feed are the
+highest-quality sources in the app and all three are free, so building import
+and the live earthquake feed work on a fresh install with an empty `.env`.
+
+## Demonstrating it
+
+`PRESENTING.md` is a 3½-minute script with times, the exact lines that land,
+what to check five minutes beforehand, and the four questions an audience
+actually asks.
+
+
+Node → Demonstration has explicit controls to inject a magnitude 6.4 nearby, a
+distant magnitude 7.4, structural damage, and a connection drop mid-event. These
+are labelled and in the open rather than hidden behind a debug flag, because the
+product is meant to be shown to somebody without hardware.
+
+**Settings → Run the full demonstration** hands the whole thing over for three
+and a half minutes: the model, a real earthquake record, the node's complete
+event sequence, the emergency call, the measurement afterwards and the map. The
+caption for each beat assembles itself a word at a time, at about reading speed,
+so an audience is looking at the right part of the screen when it changes — and
+the hardware beats are driven by the *node's* own messages, so if the board
+stalls the demonstration visibly stalls with it. Nothing needs to be touched.
+
+Presentation mode in the ⋯ menu is the shorter ninety-second version of the same
+argument, without the hardware sequence.
+
+To open straight onto any screen — useful for screenshots and demos. Every
+section works, not only the five with tabs:
+
+```
+SEISMIC_INITIAL_TAB=simulator
+SEISMIC_INITIAL_TAB=prepare
+SEISMIC_INITIAL_TAB=network
+SEISMIC_INITIAL_TAB=device
+SEISMIC_INITIAL_TAB=channels
+SEISMIC_SHOWCASE=1        starts the full demonstration on launch
+SEISMIC_SKIP_SIGN_IN=1    grants a guest account and suppresses the
+                          notification prompt, for screenshot runs
+```
+
+## The hardware
+
+`arduino.ino` is the firmware for an Arduino MEGA node: six sensors, a two-of-
+three fusion vote, two verified actuators, a chunked recording and a structural
+assessment. It talks newline-delimited JSON over BLE (service FFE0,
+characteristic FFE1) and takes plain-text commands back.
+
+**Hardware → Test earthquake** runs the node's entire event sequence, and the
+app follows it live — declaration with the vote breakdown, countdown, power cut
+with its photoresistor evidence, water main, recording transfer, period
+re-measurement, verdict. The presenter never touches the board.
+
+Everything works with no board present. The simulated node emits the same lines
+through the same parser, so a screen that works against it works against the
+hardware; a test asserts it can produce all sixteen message types and that every
+line it emits parses.
+
+Two things worth knowing about the protocol as built:
+
+* **`REC:n` re-sends a single chunk.** Added to the firmware for this — before
+  it existed, one dropped BLE notification meant re-requesting all twenty-five
+  chunks, three seconds of airtime to recover twenty samples with a fair chance
+  of losing a different one on the way. The app now asks for exactly what is
+  missing, and keeps what already arrived either way.
+* **The gas valve is modelled and unavailable.** A servo drawing 250 mA
+  alongside a stepper drawing 260 browns out a board with a 500 mA budget. One
+  actuator had to be shed; the console says so rather than hiding it.
+
+## The parts that talk
+
+**The node narrates itself.** The same message stream that drives the
+instrument panels is read a second time in plain English — "I can feel the
+building moving and I can hear it, that's 2 of my 3 sensors, so I'm declaring
+it", "shutting off the building's power now", "confirmed off, I watched the
+light go from 320 to 890". It is not a log: telemetry arrives every second and
+acceleration far faster, and almost every line is unchanged from the one before
+it, so a sentence is only emitted when something *changed*. Four of them are
+important enough to be spoken aloud and the rest are not, which is the whole
+difference between a commentary and a machine talking through an earthquake.
+
+It also infers one thing the node cannot sense directly: a loud noise with no
+ground motion underneath it is not shaking, it is something hitting the floor.
+During an event that means debris, which is exactly what somebody deciding
+whether to walk back inside needs told.
+
+**The phone calls emergency services, and does not.** A node that has just
+declared an earthquake knows the address, the height, the construction, the
+shaking, whether anyone was home and which utilities are already off — eleven
+seconds of report, more accurate than anything an occupant could manage while
+the floor is moving. So the app places the call and reads it out. There is no
+`tel:` URL anywhere in the file and no telephony framework imported: an app that
+demonstrates an automatic emergency call must not be one wrong tap away from
+placing one. Every stage is a timer and every dispatcher line is a script, and
+the banner saying so is the first element on the screen and cannot be dismissed.
+The *report* is real — assembled from the actual event, the actual building, and
+only those actuators whose shutoff was physically confirmed, because telling a
+dispatcher the power is off when it might not be is how a firefighter gets hurt.
+
+## Notes on a few decisions
+
+**The simulated node is a first-class citizen, not a mock.** It runs the same
+STA/LTA detector the firmware runs, streams a genuine noise floor with the
+building's own resonance in it, serialises actuators against the real USB power
+budget, browns out if asked to move two motors at once, drifts its period with
+temperature, and permanently softens when it decides the building was damaged.
+Every screen is therefore exercised by realistic data during development.
+
+**Actuators fire one at a time.** A USB port supplies 500 mA; the board takes
+about 180 mA and a servo draws around 250 mA while turning a valve. Two at once
+browns out the microcontroller — mid-earthquake, having already been told to
+close the gas. The app presents the sequence as a timeline, which is also the
+clearest way to show that each action was independently confirmed.
+
+**Nothing contributes to a verdict invisibly.** Each measurement becomes a
+stated piece of evidence with its own headline, explanation, source and weight,
+and the assessment screen lists all of them. Contradictory evidence widens the
+reported interval rather than being averaged away, and a wide interval produces
+"needs inspection" rather than being rounded down to green.
+
+**Green, amber and red are reserved for structural verdicts** and appear nowhere
+else in the interface. Every verdict also carries a distinct glyph and border
+weight, so it survives colour blindness, greyscale and a cracked screen.
+
+**A model that says nothing is better than one that guesses.** Two sources that
+disagree about a building's height are never averaged, because the average is a
+number neither of them claims. The higher-confidence value is kept, the conflict
+is recorded in its provenance, and the confidence goes down rather than up.
+
+**Every spoken line has a local twin.** The emergency sentences are pre-rendered
+after each assessment, so the line that would be spoken during the *next* event
+is already cached before it happens — and if it is not, the device's own voice
+says the same words immediately. A voice that needs a network is a voice that
+fails at exactly the moment the network does.
